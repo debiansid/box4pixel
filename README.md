@@ -1,5 +1,5 @@
 # credit 
 https://github.com/CHIZI-0618/box4magisk
 
-#claim 
+# notice
 sing-box tproxy only!
