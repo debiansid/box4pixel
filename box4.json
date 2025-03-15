@@ -1,6 +1,6 @@
 {
-    "version": "v0.1.1",
-    "versionCode": "011",
+    "version": "v0.1",
+    "versionCode": "010",
     "zipUrl": "https://github.com/debiansid/box4pixel/releases/download/v0.1.1/box4pixel_v0.1.1.zip",
     "changelog": "https://raw.githubusercontent.com/debiansid/box4pixel/dev/changelog.md"
 }
