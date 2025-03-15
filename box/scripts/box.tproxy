@@ -1,0 +1,145 @@
+#!/system/bin/sh
+
+export PATH="/data/adb/magisk:/data/adb/ksu/bin:/data/adb/ap/bin:$PATH:/data/data/com.termux/files/usr/bin"
+
+scripts=$(realpath $0)
+scripts_dir=$(dirname ${scripts})
+
+source ${scripts_dir}/box.config
+
+# Logging function
+log() {
+  export TZ=Asia/Shanghai
+  now=$(date +"[%Y-%m-%d %H:%M:%S %Z]")
+  case "$1" in
+    Info)
+      [ -t 1 ] && echo -e "\033[1;32m${now} [Info]: $2\033[0m" || echo "${now} [Info]: $2" >> "${run_path}/box.log"
+      ;;
+    Warn)
+      [ -t 1 ] && echo -e "\033[1;33m${now} [Warn]: $2\033[0m" || echo "${now} [Warn]: $2" >> "${run_path}/box.log"
+      ;;
+    Error)
+      [ -t 1 ] && echo -e "\033[1;31m${now} [Error]: $2\033[0m" || echo "${now} [Error]: $2" >> "${run_path}/box.log"
+      ;;
+    *)
+      [ -t 1 ] && echo -e "\033[1;30m${now} [$1]: $2\033[0m" || echo "${now} [$1]: $2" >> "${run_path}/box.log"
+      ;;
+  esac
+}
+
+# Calculate UIDs for user-package pairs
+uid_list=()
+find_packages_uid() {
+  for user_package in "${user_packages_list[@]}"; do
+    user=$(echo "${user_package}" | awk -F ':' '{print $1}')
+    package=$(echo "${user_package}" | awk -F ':' '{print $2}')
+    uid=$(awk -v pkg="$package" '$1==pkg {print $2}' /data/system/packages.list)
+    if [ -n "$uid" ]; then
+      uid_list+=($(expr "${user}" \* 100000 + "${uid}"))
+    else
+      log Warn "Package $package not found in /data/system/packages.list"
+    fi
+  done
+}
+
+# Enable TPROXY mode (IPv4 only)
+enable_tproxy() {
+  log Info "Enabling TPROXY mode..."
+
+  # Set up routing rules (IPv4)
+  ip rule add fwmark "${id}" table "${id}" pref "${id}" || { log Error "Failed to add IPv4 ip rule"; return 1; }
+  ip route add local default dev lo table "${id}" || { log Error "Failed to add IPv4 ip route"; return 1; }
+
+  # Create and flush mangle chains (IPv4)
+  iptables -t mangle -N BOX_EXTERNAL 2>/dev/null || iptables -t mangle -F BOX_EXTERNAL
+  iptables -t mangle -N BOX_LOCAL 2>/dev/null || iptables -t mangle -F BOX_LOCAL
+  iptables -t mangle -N DIVERT 2>/dev/null || iptables -t mangle -F DIVERT
+
+  # Bypass intranet subnets (IPv4)
+  for subnet in "${intranet[@]}"; do
+    iptables -t mangle -A BOX_EXTERNAL -d "${subnet}" -p udp ! --dport 53 -j RETURN
+    iptables -t mangle -A BOX_EXTERNAL -d "${subnet}" ! -p udp -j RETURN
+    iptables -t mangle -A BOX_LOCAL -d "${subnet}" -p udp ! --dport 53 -j RETURN
+    iptables -t mangle -A BOX_LOCAL -d "${subnet}" ! -p udp -j RETURN
+  done
+
+  # TPROXY rules for lo interface (IPv4)
+  iptables -t mangle -A BOX_EXTERNAL -p tcp -i lo -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${id}"
+  iptables -t mangle -A BOX_EXTERNAL -p udp -i lo -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${id}"
+
+  # Allow AP interfaces (IPv4)
+  if [ -n "${ap_list[*]}" ]; then
+    for ap in "${ap_list[@]}"; do
+      iptables -t mangle -A BOX_EXTERNAL -p tcp -i "${ap}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${id}"
+      iptables -t mangle -A BOX_EXTERNAL -p udp -i "${ap}" -j TPROXY --on-port "${tproxy_port}" --tproxy-mark "${id}"
+    done
+    log Info "Enabled transparent proxy for AP interfaces: ${ap_list[*]}"
+  fi
+
+  # Apply prerouting rule (IPv4)
+  iptables -t mangle -I PREROUTING -j BOX_EXTERNAL || log Error "Failed to apply IPv4 BOX_EXTERNAL chain"
+
+  # Bypass proxy service itself (IPv4)
+  iptables -t mangle -I BOX_LOCAL -m owner --gid-owner 23333 -j RETURN
+
+  # Handle app-specific proxying (IPv4)
+  if [ ${#uid_list[@]} -eq 0 ]; then
+    iptables -t mangle -A BOX_LOCAL -p tcp -j MARK --set-mark "${id}"
+    iptables -t mangle -A BOX_LOCAL -p udp -j MARK --set-mark "${id}"
+    log Info "Transparent proxy enabled for all apps"
+  else
+    for appid in "${uid_list[@]}"; do
+      iptables -t mangle -I BOX_LOCAL -m owner --uid-owner "${appid}" -j RETURN
+    done
+    iptables -t mangle -A BOX_LOCAL -p tcp -j MARK --set-mark "${id}"
+    iptables -t mangle -A BOX_LOCAL -p udp -j MARK --set-mark "${id}"
+    log Info "Transparent proxy bypassed for: ${user_packages_list[*]}"
+  fi
+
+  # Apply output rule (IPv4)
+  iptables -t mangle -I OUTPUT -j BOX_LOCAL || log Error "Failed to apply IPv4 BOX_LOCAL chain"
+
+  # Set up DIVERT chain for socket marking (IPv4)
+  iptables -t mangle -A DIVERT -j MARK --set-mark "${id}"
+  iptables -t mangle -A DIVERT -j ACCEPT
+  iptables -t mangle -I PREROUTING -p tcp -m socket -j DIVERT
+
+  # Prevent loopback to tproxy_port (IPv4)
+  iptables -A OUTPUT -d 127.0.0.1 -p tcp -m owner --gid-owner 23333 -m tcp --dport "${tproxy_port}" -j REJECT
+}
+
+# Disable TPROXY mode (IPv4 only)
+disable_tproxy() {
+  log Info "Disabling TPROXY mode..."
+
+  # Clean up routing rules (IPv4)
+  ip rule del fwmark "${id}" table "${id}" 2>/dev/null
+  ip route flush table "${id}" 2>/dev/null
+
+  # Remove iptables rules (IPv4)
+  iptables -t mangle -D PREROUTING -j BOX_EXTERNAL 2>/dev/null
+  iptables -t mangle -D PREROUTING -p tcp -m socket -j DIVERT 2>/dev/null
+  iptables -t mangle -D OUTPUT -j BOX_LOCAL 2>/dev/null
+  iptables -D OUTPUT -d 127.0.0.1 -p tcp -m owner --gid-owner 23333 -m tcp --dport "${tproxy_port}" -j REJECT 2>/dev/null
+
+  # Flush and delete chains (IPv4)
+  for chain in BOX_EXTERNAL BOX_LOCAL DIVERT; do
+    iptables -t mangle -F "${chain}" 2>/dev/null
+    iptables -t mangle -X "${chain}" 2>/dev/null
+  done
+}
+
+# Handle enable/disable commands
+case "$1" in
+  enable)
+    find_packages_uid
+    enable_tproxy
+    ;;
+  disable)
+    disable_tproxy
+    ;;
+  *)
+    log Error "Usage: $0 {enable|disable}"
+    exit 1
+    ;;
+esac
