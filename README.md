@@ -5,4 +5,5 @@ https://github.com/CHIZI-0618/box4magisk
 
 
 # notice
-sing-box tproxy only!
+1. rooted device
+2. sing-box tproxy only!
